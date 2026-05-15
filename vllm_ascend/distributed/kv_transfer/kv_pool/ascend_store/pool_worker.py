@@ -2,6 +2,7 @@ import importlib
 import logging
 import math
 import threading
+import time
 from collections.abc import Generator
 
 import torch
@@ -158,6 +159,8 @@ class KVPoolWorker:
 
         self.finished_store_req: set[str] = set()
 
+        self.ext_cache_load_timing: dict[str, tuple[float, int]] = {}
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         _, first_kv_cache_tuple = next(iter(kv_caches.items()))
         first_kv_cache = first_kv_cache_tuple[0]
@@ -268,16 +271,25 @@ class KVPoolWorker:
             else:
                 token_len = request.load_spec.kvpool_cached_tokens
             request.load_spec.token_len = token_len
+            num_loaded_tokens = token_len - load_spec.vllm_cached_tokens
             if self.use_layerwise:
+                load_start = time.perf_counter()
                 layerwise_retriever = self.retrieve_layer(request)
                 next(layerwise_retriever)  # first layer load
                 self.layerwise_retrievers.append(layerwise_retriever)
+                load_end = time.perf_counter()
+                load_duration_ms = (load_end - load_start) * 1000
+                self.ext_cache_load_timing[request.req_id] = (
+                    load_duration_ms,
+                    num_loaded_tokens,
+                )
             else:
                 if self.load_async:
                     self.kv_recv_thread.add_request(  # type: ignore[union-attr]
                         request,
                     )
                 else:
+                    load_start = time.perf_counter()
                     addr_list = []
                     size_list = []
                     key_list = []
@@ -297,6 +309,12 @@ class KVPoolWorker:
                         size_list[self.tp_rank % len(size_list) :] + size_list[: self.tp_rank % len(size_list)]
                     )
                     self.m_store.get(key_list_c, addr_list_c, size_list_c)
+                    load_end = time.perf_counter()
+                    load_duration_ms = (load_end - load_start) * 1000
+                    self.ext_cache_load_timing[request.req_id] = (
+                        load_duration_ms,
+                        num_loaded_tokens,
+                    )
 
     def wait_for_layer_load(self) -> None:
         for layerwise_retriever in self.layerwise_retrievers:
