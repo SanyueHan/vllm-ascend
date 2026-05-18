@@ -224,6 +224,16 @@ class AscendStoreConnector(KVConnectorBase_V1):
         ascend_store_kv_events.add_events(events)
         return ascend_store_kv_events
 
+    def get_ext_cache_load_timing(self) -> dict[str, tuple[float, int]]:
+        """
+        Get the external cache load timing per request and clear it.
+        """
+        if self.connector_worker is None:
+            return {}
+        timing = self.connector_worker.ext_cache_load_timing.copy()
+        self.connector_worker.ext_cache_load_timing.clear()
+        return timing
+
 
 class LookupKeyServer:
     def __init__(
