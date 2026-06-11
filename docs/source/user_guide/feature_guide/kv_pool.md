@@ -495,10 +495,8 @@ Memcache support two modes of deployments:
 - **Integrated Deployment**: LocalService is launched with vLLM processes. This is the default mode. 
 - **Separated Deployment**: LocalService is launched independently before vLLM processes. This is recommended for A3 + device_sdma scenario.
 
-<div style="display: flex; gap: 10px;">
-  <img src="images/memcache_integrated_deployment.png" alt="Memcache Integrated Deployment" style="width: 50%;">
-  <img src="images/memcache_separated_deployment.png" alt="Memcache Separated Deployment" style="width: 50%;">
-</div>
+![memcache_integrated_deployment.png](images/memcache_integrated_deployment.png)
+![memcache_separated_deployment.png](images/memcache_separated_deployment.png)
 
 ### Installing Memcache
 
