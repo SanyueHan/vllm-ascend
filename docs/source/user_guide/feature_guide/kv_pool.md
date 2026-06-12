@@ -492,11 +492,11 @@ This is because HCCL one-sided communication connections are created lazily afte
 Memcache is a distributed key-value store that provides a high-performance cache for accelerators. It is designed to be used with MemFabric, which provides high-performance communication between accelerators and host.
 
 Memcache support two modes of deployments: 
-- **Integrated Deployment**: LocalService is launched with vLLM processes. This is the default mode. 
-- **Separated Deployment**: LocalService is launched independently before vLLM processes. This is recommended for A3 + device_sdma scenario.
+- **Embedded Deployment**: LocalService is launched with vLLM processes. This is the default mode. 
+- **Standalone Deployment**: LocalService is launched independently before vLLM processes. This is recommended for A3 + device_sdma scenario.
 
-![memcache_integrated_deployment.png](images/memcache_integrated_deployment.png)
-![memcache_separated_deployment.png](images/memcache_separated_deployment.png)
+![memcache_embedded_deployment.png](images/memcache_embedded_deployment.png)
+![memcache_standalone_deployment.png](images/memcache_standalone_deployment.png)
 
 ### Installing Memcache
 
@@ -539,7 +539,7 @@ ock.mmc.local_service.dram.size = 1GB
 
 **Note**
 
-For Separated Deployment, please add the following configuration to the `mmc-local.conf` file:
+For Standalone Deployment, please add the following configuration to the `mmc-local.conf` file:
 ```ini
 ock.mmc.local_service.max.dram.size = 1024GB
 ```
@@ -556,8 +556,8 @@ export MMC_META_CONFIG_PATH=/usr/local/memcache_hybrid/latest/config/mmc-meta.co
 python -c "from memcache_hybrid import MetaService; MetaService.main()"
 ```
 
-#### (2) Start Memcache Independent Process (Only For Separated Deployment Mode)
-**Ignore this step if you are using Integrated Deployment**
+#### (2) Start Memcache Independent Process (Only For Standalone Deployment Mode)
+**Ignore this step if you are using Embedded Deployment**
 
 Run [mem_scan.py](https://gitcode.com/Ascend/memfabric_hybrid/blob/develop/script/mem_scan.py) to check the maximum size of DRAM memory could be applied in this server. 
 
