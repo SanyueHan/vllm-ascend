@@ -559,7 +559,7 @@ python -c "from memcache_hybrid import MetaService; MetaService.main()"
 #### (2) Start Memcache Independent Process (Only For Separated Deployment Mode)
 **Ignore this step if you are using Integrated Deployment**
 
-Run [mem_scan.py](urlhttps://gitcode.com/Ascend/memfabric_hybrid/blob/develop/script/mem_scan.py) to check the maximum size of DRAM memory could be applied in this server. 
+Run [mem_scan.py](https://gitcode.com/Ascend/memfabric_hybrid/blob/develop/script/mem_scan.py) to check the maximum size of DRAM memory could be applied in this server. 
 
 `python3 mem_scan.py`
 
