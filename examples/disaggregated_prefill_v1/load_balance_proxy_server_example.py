@@ -162,6 +162,7 @@ class InstanceInfo:
     decoder_host: str
     decoder_port: int
     prefiller_cached_tokens: int | None = None
+    prefix_hash: int | None = None
 
 
 TAINT_PRIORITY = 1e15
@@ -191,6 +192,27 @@ def update_cached_tokens_in_chunk(chunk_json: dict, cached_tokens: int | None) -
 def encode_response_chunk(chunk_json: dict, is_sse: bool) -> bytes:
     chunk = json.dumps(chunk_json, ensure_ascii=False).encode("utf-8")
     return b"data: " + chunk + b"\n\n" if is_sse else chunk
+
+
+def extract_prefix_hash(req_data: dict, prefix_chars: int) -> int | None:
+    """Extract a hash of the first ``prefix_chars`` characters of the prompt.
+
+    Returns ``None`` when the prompt is shorter than ``prefix_chars`` or when
+    the request body doesn't contain a usable prompt field.
+    """
+    if "prompt" in req_data:
+        text = req_data["prompt"]
+    elif "messages" in req_data:
+        messages = req_data.get("messages", [])
+        if messages and isinstance(messages[0], dict):
+            text = messages[0].get("content", "")
+        else:
+            return None
+    else:
+        return None
+    if not isinstance(text, str) or len(text) < prefix_chars:
+        return None
+    return hash(text[:prefix_chars])
 
 
 global_args: argparse.Namespace | None = None
@@ -270,7 +292,7 @@ class SharedProxyScheduler:
     not match) are skipped on pop.
     """
 
-    def __init__(self, prefiller_instances, decoder_instances):
+    def __init__(self, prefiller_instances, decoder_instances, fallback_ratio=1.5):
         self._lock = threading.RLock()
         self.request_num = 0
         self.waiting_nodes: dict[str, tuple[str, tuple[str, int], int]] = {}
@@ -279,6 +301,9 @@ class SharedProxyScheduler:
             ServerRole.DECODE: RolePools(),
         }
         self._ordinal = 0
+        self._fallback_ratio = fallback_ratio
+        self.prefix_to_prefiller: dict[int, str] = {}
+        self.prefix_last_hit: dict[int, float] = {}
 
         for host, port in prefiller_instances:
             self._add_server_no_lock(ServerRole.PREFILL, host, port)
@@ -346,6 +371,86 @@ class SharedProxyScheduler:
         self._push_heap(role, key)
         return True
 
+    def _get_current_priority(self, role: ServerRole, key: str) -> float:
+        """Return the current load priority for the given server key."""
+        if key in self._pool(role).tainted:
+            return TAINT_PRIORITY
+        entry = self._pool(role).servers[key]
+        if role is ServerRole.PREFILL:
+            return entry.active_tokens + entry.active_kv_cache * 0.3
+        return entry.active_tokens
+
+    def _get_min_priority(self, role: ServerRole) -> float:
+        """Peek at the minimum valid priority in the heap without side effects."""
+        pool = self._pool(role)
+        heap_copy = list(pool.heap)
+        while heap_copy:
+            priority, _, seq, key = heapq.heappop(heap_copy)
+            if key not in pool.servers:
+                continue
+            entry = pool.servers[key]
+            if entry.heap_seq == seq:
+                return priority
+        return TAINT_PRIORITY
+
+    def _remove_prefixes_for_servers(self, removed_keys: set[str]) -> None:
+        """Drop prefix mappings that point to any of the removed servers."""
+        stale = [h for h, k in self.prefix_to_prefiller.items() if k in removed_keys]
+        for h in stale:
+            self.prefix_to_prefiller.pop(h, None)
+            self.prefix_last_hit.pop(h, None)
+
+    def _cleanup_prefix_mappings(self) -> None:
+        """Evict the oldest prefix mappings when the cache grows too large."""
+        max_mappings = max(100, len(self._pool(ServerRole.PREFILL).servers) * 100)
+        if len(self.prefix_to_prefiller) <= max_mappings:
+            return
+        sorted_by_time = sorted(self.prefix_last_hit.items(), key=lambda x: x[1])
+        to_remove = len(sorted_by_time) // 4
+        for h, _ in sorted_by_time[:to_remove]:
+            self.prefix_to_prefiller.pop(h, None)
+            self.prefix_last_hit.pop(h, None)
+
+    def _pick_prefiller_with_affinity(
+        self,
+        load: float,
+        prefix_hash: int | None,
+        *,
+        kv_cache: bool,
+    ) -> dict[str, Any]:
+        """Pick a prefiller, preferring the one mapped by ``prefix_hash``.
+
+        When the preferred server's load is not significantly higher than the
+        least-loaded server it will be used, otherwise the mapping is cleared
+        and the global least-loaded server is selected instead.
+        """
+        pool = self._pool(ServerRole.PREFILL)
+        if prefix_hash is not None and prefix_hash in self.prefix_to_prefiller:
+            preferred_key = self.prefix_to_prefiller[prefix_hash]
+            if preferred_key in pool.servers and preferred_key not in pool.tainted:
+                preferred_priority = self._get_current_priority(ServerRole.PREFILL, preferred_key)
+                min_priority = self._get_min_priority(ServerRole.PREFILL)
+                if preferred_priority <= min_priority * self._fallback_ratio:
+                    entry = pool.servers[preferred_key]
+                    if kv_cache:
+                        entry.active_kv_cache += load
+                    self._push_heap(ServerRole.PREFILL, preferred_key)
+                    self.prefix_last_hit[prefix_hash] = time.time()
+                    return {"key": preferred_key, "host": entry.host, "port": entry.port}
+                self.prefix_to_prefiller.pop(prefix_hash, None)
+                self.prefix_last_hit.pop(prefix_hash, None)
+
+        key = self._pop_valid(ServerRole.PREFILL)
+        entry = pool.servers[key]
+        if kv_cache:
+            entry.active_kv_cache += load
+        self._push_heap(ServerRole.PREFILL, key)
+        if prefix_hash is not None:
+            self.prefix_to_prefiller[prefix_hash] = key
+            self.prefix_last_hit[prefix_hash] = time.time()
+            self._cleanup_prefix_mappings()
+        return {"key": key, "host": entry.host, "port": entry.port}
+
     def get_snapshot(self) -> dict[str, list[dict[str, Any]]]:
         with self._lock:
             return {
@@ -412,17 +517,26 @@ class SharedProxyScheduler:
             entry.active_kv_cache = max(0.0, entry.active_kv_cache - load)
         self._push_heap(role, key)
 
-    def begin_request(self, load: float) -> dict[str, Any]:
-        """Pick a prefiller, reserve KV pressure, and count this as an active request."""
+    def begin_request(self, load: float, prefix_hash: int | None = None) -> dict[str, Any]:
+        """Pick a prefiller, reserve KV pressure, and count this as an active request.
+
+        When ``prefix_hash`` is provided, the scheduler attempts to reuse the same
+        prefiller that handled previous requests with the same hash, which enables
+        KV cache reuse across requests.
+        """
         with self._lock:
-            picked = self._pick_server(ServerRole.PREFILL, load, kv_cache=True)
+            picked = self._pick_prefiller_with_affinity(load, prefix_hash, kv_cache=True)
             self.request_num += 1
             return picked
 
-    def reserve_prefill_kv(self, load: float) -> dict[str, Any]:
-        """Pick a prefiller for recompute without bumping the active request count."""
+    def reserve_prefill_kv(self, load: float, prefix_hash: int | None = None) -> dict[str, Any]:
+        """Pick a prefiller for recompute without bumping the active request count.
+
+        When ``prefix_hash`` is provided, the same affinity rules as ``begin_request``
+        are applied so that recompute also lands on the same prefiller.
+        """
         with self._lock:
-            return self._pick_server(ServerRole.PREFILL, load, kv_cache=True)
+            return self._pick_prefiller_with_affinity(load, prefix_hash, kv_cache=True)
 
     def pick_decoder(self, load: float) -> dict[str, Any]:
         with self._lock:
@@ -507,6 +621,7 @@ class SharedProxyScheduler:
                 self.waiting_nodes.pop(key, None)
             pool.tainted.difference_update(keys)
             if removed:
+                self._remove_prefixes_for_servers(keys)
                 self._reset_heap(role, bump_seq=True)
                 self.log_status(f"Remove {role.value} instances: {sorted(keys)}.")
             return False
@@ -523,6 +638,7 @@ class SharedProxyScheduler:
                 for key in keys:
                     pool.servers.pop(key, None)
                 pool.tainted.clear()
+                self._remove_prefixes_for_servers(set(keys))
                 self._reset_heap(role, bump_seq=True)
                 self.log_status(f"Remove {role.value} instances after drain: {keys}.")
 
@@ -701,6 +817,26 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Log level for the proxy server.",
     )
+    parser.add_argument(
+        "--prefix-affinity-chars",
+        type=int,
+        default=0,
+        help=(
+            "Number of leading prompt characters to use for prefix-affinity scheduling. "
+            "When > 0, requests with the same prefix are routed to the same prefiller "
+            "to maximise KV cache reuse across requests.  Default: 0 (disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--prefix-affinity-fallback-ratio",
+        type=float,
+        default=1.5,
+        help=(
+            "When the preferred prefiller's load exceeds (min_server_load * this ratio) "
+            "the request falls back to normal least-loaded scheduling. "
+            "Only meaningful when --prefix-affinity-chars > 0.  Default: 1.5."
+        ),
+    )
     args = parser.parse_args()
     if len(args.prefiller_hosts) != len(args.prefiller_ports):
         raise ValueError("Number of prefiller hosts must match number of prefiller ports")
@@ -734,7 +870,10 @@ def bootstrap_parent_process(args: argparse.Namespace) -> None:
     if args.workers <= 1:
         return
 
-    shared_scheduler = SharedProxyScheduler(args.prefiller_instances, args.decoder_instances)
+    shared_scheduler = SharedProxyScheduler(
+        args.prefiller_instances, args.decoder_instances,
+        fallback_ratio=args.prefix_affinity_fallback_ratio,
+    )
     NodeListener(shared_scheduler)
 
     authkey = os.urandom(16)
@@ -750,7 +889,10 @@ def _ensure_scheduler(args) -> SharedProxyScheduler:
     global shared_scheduler
     if shared_scheduler is not None:
         return shared_scheduler
-    shared_scheduler = SharedProxyScheduler(args.prefiller_instances, args.decoder_instances)
+    shared_scheduler = SharedProxyScheduler(
+        args.prefiller_instances, args.decoder_instances,
+        fallback_ratio=args.prefix_affinity_fallback_ratio,
+    )
     NodeListener(shared_scheduler)
     return shared_scheduler
 
@@ -927,14 +1069,19 @@ async def assign_instances(
     request_length: int,
     *,
     is_initial_request: bool,
+    prefix_hash: int | None = None,
 ) -> InstanceInfo:
     runtime = get_runtime()
     args = get_global_args()
+    if prefix_hash is None:
+        prefix_affinity_chars = args.prefix_affinity_chars
+        if prefix_affinity_chars > 0:
+            prefix_hash = extract_prefix_hash(req_data, prefix_affinity_chars)
     prefiller_score = calculate_prefill_score(request_length)
     decoder_score = calculate_decode_score(request_length)
     request_id = next_req_id()
     pick_prefill = "begin_request" if is_initial_request else "reserve_prefill_kv"
-    prefiller = await runtime.schedule(pick_prefill, prefiller_score)
+    prefiller = await runtime.schedule(pick_prefill, prefiller_score, prefix_hash=prefix_hash)
     prefiller_key = prefiller["key"]
 
     try:
@@ -974,6 +1121,7 @@ async def assign_instances(
         decoder_host=decoder["host"],
         decoder_port=decoder["port"],
         prefiller_cached_tokens=prefiller_cached_tokens,
+        prefix_hash=prefix_hash,
     )
 
 
@@ -986,7 +1134,11 @@ async def reassign_instances(
     runtime = get_runtime()
     await runtime.schedule("release_prefill_kv", previous_instance.prefiller_key, previous_instance.prefiller_score)
     await runtime.schedule("release_decoder", previous_instance.decoder_key, previous_instance.decoder_score)
-    return await assign_instances(api, req_data, request_length, is_initial_request=False)
+    return await assign_instances(
+        api, req_data, request_length,
+        is_initial_request=False,
+        prefix_hash=previous_instance.prefix_hash,
+    )
 
 
 async def handle_completions_impl(api: str, request: Request):
